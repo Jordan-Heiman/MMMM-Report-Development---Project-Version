@@ -3,3 +3,10 @@
 .Rdata
 .httr-oauth
 .DS_Store
+
+/data/raw_data
+/data/temp_data
+flagged*.csv
+missing*.csv
+Rscript_reportdataformat.R
+/*Reports*
