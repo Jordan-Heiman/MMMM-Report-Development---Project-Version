@@ -1,0 +1,328 @@
+---
+params: 
+  region: "add region"
+  forest: "add forest"
+  ranger_district: "add ranger district"
+  sf_obj: "sf_obj"
+  tl_sf: "tl_sf"
+  data_tbl: "clean_tbl"
+  dates: "date_range"
+  target_lst: "targets"
+  sub_txt: ""
+  map: "map"
+  add_on_head: "testing 123"
+  add_on: ""
+output: pdf_document
+title: "Multispecies Mesocarnivore Monitoring Report"
+subtitle: "`r params$sub_txt`"
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+# Set up a couple global options for the Markdown Environment
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", comment = "")
+set_flextable_defaults(fonts_ignore = TRUE)
+
+# Filter the sf_obj and track log sf to just the ranger district(s) and forest(s) 
+# selected, also limit the table to the data to the date range and columns needed 
+# for the report; create a survey length column that will serve as both days 
+# deployed and kilometers surveyed (This is something that could possibly be done 
+# before bringing into the markdown file and may speed up the PDF creation)
+rd_sf <- unique(params$sf_obj[forest_name %in% params$forest 
+                              & ranger_district %in% params$ranger_district 
+                              & between(survey_start_date, params$dates[[1]], params$dates[[2]]),
+                              c("unit_name","survey_id", "survey_name", "survey_type", "survey_start_date",
+                                "survey_end_date", "forest_name", "ranger_district")
+                              ][, survey_length := as.numeric(survey_end_date - survey_start_date)
+                                ][grepl("track survey|back track", survey_type), survey_length := NA])
+
+if (nrow(params$tl_sf) > 0) {
+  rd_tl <- as.data.table(filter(params$tl_sf, forest_name %in% params$forest 
+                                & ranger_district %in% params$ranger_district 
+                                & between(survey_start_date, params$dates[[1]], params$dates[[2]])
+                                )[, c("unit_name", "survey_id", "survey_name", "survey_type", "survey_start_date", "survey_end_date",
+                                      "total_survey_length_km", "forest_name", "ranger_district")])
+
+  rd_tl[, geometry := NULL
+        ][, survey_length := total_survey_length_km
+                        ][, total_survey_length_km := NULL]
+}
+
+# Start creating an effort table by first bringing together the two sf object 
+# tables (one is track logs the other is all the point survey and detection data)
+rd_surveys <- rbind(rd_sf, get0("rd_tl"), fill = TRUE)
+
+# Use the site_ids from this merged table to filter the data table, then filter 
+# the data table to only detections of target species
+rd_data <- unique(params$data_tbl[survey_id %in% rd_surveys$survey_id 
+                                  & flag_reason == "", c("survey_id", "genus", "species")
+                                  ][, genus_species := str_to_sentence(paste(genus, species, sep = " "))
+                                    ][, c("genus", "species") := NULL
+                                      ][(genus_species %in% params$target_lst), ])
+
+# Format the survey length as a number for calculations to be possible
+rd_surveys[, survey_length := as.numeric(survey_length)]
+
+# If a row is missing the survey length, fill it in based on other rows from 
+# the same site
+rd_surveys2 <- unique(rd_surveys[, survey_length := nafill(survey_length, "nocb"), by = survey_id])
+
+# Create a list of survey types
+survey_types <- unique(rd_surveys2$survey_type)
+
+# Set up an empty table to hold all the detection information
+results_all <- data.table()
+
+# Set up an empty table to hold all the effort information
+effort_tbl <- data.table("Survey Type" = character(),
+  "Average Survey Length" = numeric(),
+  "Number of Units" = numeric(),
+  "Number of Surveys" = numeric(),
+  "Total Survey Length" = numeric())
+
+# Default footnote value to no to represent no linear surveys
+footnote <- ""
+
+# For each survey type, calculate the efforts stats and set up a table to report 
+# the detections for that survey type
+for (i in 1:length(survey_types)){
+  
+  # Set up a results table for the survey type using the merged sf data and the 
+  # filtered detection table
+  trunc_sf <- rd_surveys2[survey_type == survey_types[[i]], ]
+  results_tbl <- merge.data.table(trunc_sf, rd_data, all.x = TRUE
+                                  )[, "survey_id" := NULL
+                                    ][is.na(genus_species), genus_species := "No target species"]
+  setorder(results_tbl, survey_name)
+  
+  # Add these results to the list of results tables
+  results_all <- rbind(results_all, results_tbl)
+  
+  # Get some effort statistics for this survey type
+  survey_effort <- data.table(
+    "Survey Type" = str_to_title(survey_types[[i]]),
+    "Average Survey Length" = as.character(round(mean(trunc_sf$survey_length, na.rm = TRUE), 2)),
+    "Number of Units" = length(unique(trunc_sf$unit_name)),
+    "Number of Surveys" = length(unique(trunc_sf$survey_id)),
+    "Total Survey Length" = as.character(sum(trunc_sf$survey_length, na.rm = TRUE))
+  )
+  
+  # Adjust linears variable for if there are any track surveys or back tracks
+  if (survey_types[[i]] == "track survey" | survey_types[[i]] == "back track"){
+    footnote <- "For track surveys, length calculations only include surveys for which tracklogs were provided. NA indicates no tracklog was provided to calculate length."
+  }
+  
+  # Add these effort stats to the effort table
+  effort_tbl <- rbind(effort_tbl, survey_effort)
+
+}
+
+# Do some formatting for the effort table
+effort_tbl[grepl("Track Survey|Back Track", `Survey Type`)
+           & `Average Survey Length` != "NaN", ":=" (`Average Survey Length` = paste0(`Average Survey Length`, " km"),
+                                                     `Total Survey Length` = paste0(round(as.numeric(`Total Survey Length`), 2), " km"))]
+effort_tbl[grepl("Track Survey|Back Track", `Survey Type`)
+           & `Average Survey Length` == "NaN", ":=" (`Average Survey Length` = "NA",
+                                                     `Total Survey Length` = "NA")]
+effort_tbl[!grepl("Track Survey|Back Track", `Survey Type`), ":=" (`Average Survey Length` = paste0(`Average Survey Length`, " days"),
+                                                                   `Total Survey Length` = paste0(`Total Survey Length`, " days"))]
+
+# Set up a forest and ranger district list for text content at the beginning of the report
+if ("All" %in% params$forest){
+  purpose_txt <- paste0("all ranger districts of all forests of Region ", regmatches(params$region, regexpr(" [[:digit:]]*", params$region)))
+}else if("All" %in% params$ranger_district){
+  purpose_txt <- paste0("all ranger districts of the ", sub(",([^,]*)$", " and\\1",  paste(params$forest, collapse = ", ")))
+}else{
+  purpose_txt <- paste0("the ", sub(",([^,]*)$", " and\\1",  paste(params$ranger_district, collapse = ", ")), 
+                        " of the ", sub(",([^,]*)$", " and\\1",  paste(params$forest, collapse = ", ")))
+}
+
+```
+
+# Purpose
+
+This document reports the monitoring efforts in `r purpose_txt` from `r paste(format(params$dates[[1]], "%B"), paste0(day(params$dates[[1]]), ","), year(params$dates[[1]]))` to `r paste(format(params$dates[[2]], "%B"), paste0(day(params$dates[[2]]), ","), year(params$dates[[2]]))`.
+
+# `r params$add_on_head`
+
+`r params$add_on`
+
+```{r survey effort, warning = FALSE}
+
+# Create and print a flex-table of the effort statistics to the report PDF
+flextable(effort_tbl) %>% 
+  add_header_lines(values = "Survey Effort") %>% 
+  {if (footnote != "") footnote(.,
+                                i = 2, 
+                                j = c(2, 5),
+                                value = as_paragraph(footnote),
+                                ref_symbols = "*",
+                                part = "header") 
+    else 
+      . } %>% 
+  border_remove() %>% 
+  bold(part = "header") %>% 
+  hline(border = fp_border(width = 2), part = "header") %>%
+  hline(border = fp_border(), part = "body") %>%
+  vline(part = "body", j = 1:(ncol(effort_tbl) - 1)) %>% 
+  fontsize(size = 10, part = "all") %>% 
+  fontsize(size = 12, part = "header", i = 1) %>% 
+  align(align = "center", part = "all") %>% 
+  width(j = 1:5, width = c(1, 1.5, 1, 1, 1))
+
+```
+
+\newpage
+\centering
+# Survey Results and Maps
+
+```{r make results tables, results = "asis"}
+
+# This creates a function that will create the printed survey information 
+# flex-tables for each ranger district and survey type in the report, This 
+# function will get nested within the next function that is created. This could 
+# be done in a For loop but functions are much faster, even if the function gets 
+# put inside a For loop
+results_ft <- function(x){
+  
+  # Get the type of survey and ranger district from the table provided
+  survey_title <- str_to_title(unique(x$survey_type))
+  rd_title <- unique(x$ranger_district)
+  sec_title <- paste0(rd_title, " - ", survey_title, "s")
+  
+  # Print a header stating the ranger district name
+  cat("\\centering \n \n### ", sec_title, " \n")
+  
+  # Create a flex-table based on the type of survey represented in the table
+  if (survey_title == "Track Survey" | survey_title == "Back Track"){
+    
+    # Shorten the table to only include necessary columns for the report
+    x_cond <- x[, c("survey_name", "unit_name", "survey_start_date", "survey_length", "genus_species")]
+    
+    # Create the flex-table
+    survey_ft <- flextable(x_cond) %>% 
+      delete_part(part = "header") %>% 
+      add_header(survey_name = paste0(survey_title, " Name"), 
+                 unit_name = "Survey Unit",
+                 survey_start_date = "Survey Date",
+                 survey_length = "Survey Length (km)",
+                 genus_species = "Species Detected") %>% 
+      add_header_lines(values = paste0(rd_title, " - ", survey_title, "s")) %>% 
+      footnote(i = 2, 
+               j = 5,
+               value = as_paragraph(paste("Target species include:", paste(params$target_lst, collapse = ", "))),
+               ref_symbols = "*",
+               part = "header") %>% 
+      bold(part = "header") %>% 
+      hline(border = fp_border(width = 2), part = "header") %>% 
+      hline(border = fp_border(), part = "body") %>% 
+      fontsize(size = 10, part = "all") %>% 
+      fontsize(size = 12, part = "header", i = 1) %>% 
+      align(align = "center", part = "all") %>% 
+      merge_v(j = c("survey_name", 
+                    "survey_start_date",
+                    "survey_length",
+                    "unit_name"), combine = TRUE) %>% 
+      width(j = 1:5, width = c(2, 1, 1, 1, 1.5))
+    
+  }else{
+    
+    # Shorten the table to only include necessary columns for the report
+    x_cond <- x[, c("survey_name", "unit_name", "survey_start_date", "survey_end_date", "survey_length", "genus_species")]
+    
+    # Create the flex-table
+    survey_ft <- flextable(x_cond) %>% 
+        delete_part(part = "header") %>% 
+        add_header(survey_name = paste0(survey_title, " Name"), 
+                   unit_name = "Survey Unit",
+                   survey_start_date = "Date Set", 
+                   survey_end_date = "Date Retrieved", 
+                   survey_length = "Days Deployed",
+                   genus_species = "Species Detected") %>% 
+        add_header_lines(values = paste0(rd_title, " - ", survey_title, "s")) %>% 
+        footnote(i = 2, 
+                 j = 6,
+                 value = as_paragraph(paste("Target species include:", paste(params$target_lst, collapse = ", "))),
+                 ref_symbols = "*",
+                 part = "header") %>% 
+        bold(part = "header") %>% 
+        hline(border = fp_border(width = 2), part = "header") %>% 
+        hline(border = fp_border(), part = "body") %>% 
+        fontsize(size = 10, part = "all") %>% 
+        fontsize(size = 12, part = "header", i = 1) %>% 
+        align(align = "center", part = "all") %>% 
+        merge_v(j = c("survey_name", 
+                      "survey_start_date", 
+                      "survey_end_date", 
+                      "survey_length"), combine = TRUE) %>% 
+        width(j = 1:6, width = c(1, 1, 1, 1, 1, 1.5))
+    
+  }
+
+  # This function just prints the flex-table for a markdown file in HTML coding; 
+  # if ran outside of render it will be a long paragraph of HTML coding
+  flextable_to_rmd(survey_ft)
+  
+  # Insert a page break after the table
+  cat("\n \\newpage")
+
+}
+
+# Set up a function to split the forests tables into ranger district tables. This 
+# could be done in a For loop but functions are much faster, even if the function 
+# gets put inside a For loop
+forest_fun <- function(y){
+
+  # Split the provided table (table of all the data for one forest), into a list 
+  # of tables by ranger district
+  rd_split <- split(y, f = y$ranger_district)
+  
+  # Get a name of all the ranger districts in the list, the list of ranger 
+  # districts selected is not used in order to avoid dealing with the "All" 
+  # addition to the list, there are definitely other ways to get this list
+  rd_lst <- names(rd_split)
+  
+  # For each ranger district table, split it again into a list of tables by 
+  # survey type then run the function to create and print a flex-table on each 
+  # of those tables, then the map for the ranger district after all the tables
+  for(j in rd_lst){
+    st_split <- split(rd_split[[j]], f = rd_split[[j]]$survey_type)
+    
+    for(k in 1:length(st_split)){
+      results_ft(st_split[[k]])
+    }
+    
+    # Use the ranger district name to create a regular expression of the map file name
+    rd_regex <- paste0(gsub(" ", "_", j), ".jpeg")
+  
+    # Get the full map file name and location from the list of map names provided 
+    # to the markdown environment and print that map file to the report followed
+    # by a page break
+    mapfile <- here("data", "temp_data", grep(rd_regex, mapname, value = TRUE))
+    cat("![](", mapfile, ") \n \n \\newpage")
+    
+  }
+  
+}
+
+
+# Split the table of detection and survey information into a list of tables by forest
+forest_split <- split(results_all, f = results_all$forest_name)
+
+# Get a name of all the forests in the list, the list of forests selected is not 
+# used in order to avoid dealing with the "All" addition to the list, there are 
+# definitely other ways to get this list
+forest_lst <- names(forest_split)
+
+# For each forest table, print a header stating the forest name then run the 
+# function to split the table two more times and create and print the flex-tables 
+# for each survery type followed by the map for each ranger district
+for (i in forest_lst){
+  cat("\\centering \n \n## ", i, " \n")
+  forest_fun(forest_split[[i]])
+}
+
+```
+
+
+
